@@ -1,0 +1,9 @@
+{
+  "name": "Prisma AI Trading",
+  "description": "Advanced real-time trading signal analyzer powered by OpenCV and Gemini 2.5 Live API.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone",
+    "display-capture"
+  ]
+}
