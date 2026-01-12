@@ -57,3 +57,16 @@ export async function blobToBase64(blob: globalThis.Blob): Promise<string> {
     reader.readAsDataURL(blob);
   });
 }
+
+// Nova função de voz para alertas do sistema (Referência do arquivo enviado)
+export function speakSystemMessage(text: string) {
+  if ('speechSynthesis' in window) {
+      window.speechSynthesis.cancel(); // Para a fala anterior se houver
+      const utterance = new SpeechSynthesisUtterance(text);
+      utterance.rate = 1.2; // Velocidade um pouco mais rápida para alertas
+      utterance.pitch = 1;
+      utterance.volume = 1;
+      utterance.lang = 'pt-BR'; // Português Brasil
+      window.speechSynthesis.speak(utterance);
+  }
+}

@@ -1,4 +1,5 @@
 
+
 export interface SignalData {
   type: 'CALL' | 'PUT' | 'NEUTRAL';
   confidence: number;
@@ -13,6 +14,14 @@ export interface SignalData {
     breakout: string;
     zone: 'COMPRA' | 'VENDA' | 'NEUTRO';
   };
+}
+
+export interface SignalHistoryItem {
+  id: number;
+  type: 'CALL' | 'PUT';
+  time: string;
+  method: string;
+  result: 'WIN' | 'LOSS' | 'PENDING';
 }
 
 export interface ProcessingStats {
@@ -40,6 +49,7 @@ export interface OpenCV {
   threshold: (src: any, dst: any, thresh: number, maxval: number, type: number) => void;
   bitwise_not: (src: any, dst: any) => void;
   putText: (img: any, text: string, org: {x:number, y:number}, fontFace: number, fontScale: number, color: any, thickness: number) => void;
+  countNonZero: (src: any) => number;
   Rect: new (x: number, y: number, width: number, height: number) => any;
   Size: new (width: number, height: number) => any;
   Scalar: new (v0: number, v1: number, v2: number, v3?: number) => any;
@@ -47,6 +57,7 @@ export interface OpenCV {
   COLOR_RGB2HSV: number;
   COLOR_RGBA2GRAY: number;
   THRESH_BINARY: number;
+  THRESH_BINARY_INV: number;
   THRESH_OTSU: number;
   RETR_EXTERNAL: number;
   CHAIN_APPROX_SIMPLE: number;

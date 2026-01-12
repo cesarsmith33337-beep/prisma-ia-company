@@ -1,6 +1,8 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { SignalData, ProcessingStats } from '../types';
 
+const CONFIRMATION_THRESHOLD = 20; // Pixels required for breakout confirmation
+
 export const useScreenProcessor = (videoRef: React.RefObject<HTMLVideoElement>, canvasRef: React.RefObject<HTMLCanvasElement>) => {
   const [isProcessing, setIsProcessing] = useState(false);
   const [cvReady, setCvReady] = useState(false);
@@ -48,7 +50,7 @@ export const useScreenProcessor = (videoRef: React.RefObject<HTMLVideoElement>, 
         try {
           const worker = await window.Tesseract.createWorker('eng');
           await worker.setParameters({
-            tessedit_char_whitelist: '0123456789./: ', 
+            tessedit_char_whitelist: '0123456789./:- ', 
           });
           workerRef.current = worker;
           ocrCanvasRef.current = document.createElement('canvas');
@@ -114,7 +116,40 @@ export const useScreenProcessor = (videoRef: React.RefObject<HTMLVideoElement>, 
     }
   }, [stream, canvasRef]);
 
-  // --- CORE LOGIC: REAL CANDLE DETECTION ---
+  // Helper: Preprocess image for OCR (Upscale + Otsu Threshold)
+  const preprocessImageForOCR = (cv: any, src: any, roiRect: any) => {
+    if (!ocrCanvasRef.current) return null;
+    
+    // 1. Extract ROI
+    const roi = src.roi(roiRect);
+    
+    // 2. Upscale x2 for better OCR recognition on small fonts
+    const dst = new cv.Mat();
+    const dsize = new cv.Size(roiRect.width * 2, roiRect.height * 2);
+    cv.resize(roi, dst, dsize, 0, 0, cv.INTER_LINEAR);
+
+    // 3. Convert to Gray
+    const gray = new cv.Mat();
+    cv.cvtColor(dst, gray, cv.COLOR_RGBA2GRAY);
+    
+    // 4. Otsu's Thresholding (Automatic binary contrast)
+    // Combine THRESH_BINARY_INV with THRESH_OTSU to handle variable backgrounds
+    const binary = new cv.Mat();
+    cv.threshold(gray, binary, 0, 255, cv.THRESH_BINARY_INV + cv.THRESH_OTSU);
+    
+    cv.imshow(ocrCanvasRef.current, binary);
+    
+    const dataUrl = ocrCanvasRef.current.toDataURL('image/png');
+    
+    roi.delete();
+    dst.delete();
+    gray.delete();
+    binary.delete();
+    
+    return dataUrl;
+  };
+
+  // --- CORE LOGIC: REVERSAL STRATEGY + ADVANCED CANDLE DETECTION ---
   const analyzeFrame = useCallback(async () => {
     if (!cvReady || !videoRef.current || !canvasRef.current || !isProcessing) return;
     
@@ -134,7 +169,6 @@ export const useScreenProcessor = (videoRef: React.RefObject<HTMLVideoElement>, 
     const cv = window.cv;
     frameCountRef.current += 1;
     
-    // Declare all Mats for safe cleanup with explicit any type
     let src: any = null;
     let srcRGB: any = null;
     let hsv: any = null;
@@ -145,19 +179,6 @@ export const useScreenProcessor = (videoRef: React.RefObject<HTMLVideoElement>, 
     let hierarchyGreen: any = null;
     let hierarchyRed: any = null;
     
-    let lowGreen: any = null;
-    let highGreen: any = null;
-    let lowRed1: any = null;
-    let highRed1: any = null;
-    let lowRed2: any = null;
-    let highRed2: any = null;
-    let maskRed1: any = null;
-    let maskRed2: any = null;
-
-    let roiSrc: any = null;
-    let roiGray: any = null;
-    let roiBinary: any = null;
-
     try {
       src = cv.imread(canvas);
       srcRGB = new cv.Mat();
@@ -169,305 +190,292 @@ export const useScreenProcessor = (videoRef: React.RefObject<HTMLVideoElement>, 
       hierarchyGreen = new cv.Mat();
       hierarchyRed = new cv.Mat();
 
-      // --- OCR PROCESSING ---
-      if (workerRef.current && ocrCanvasRef.current && frameCountRef.current % 5 === 0) {
-          const roiX = Math.floor(canvas.width * 0.85);
-          const roiW = canvas.width - roiX;
-          if (roiW > 0) {
-            const rect = new cv.Rect(roiX, 0, roiW, canvas.height);
-            roiSrc = src.roi(rect);
-            roiGray = new cv.Mat();
-            roiBinary = new cv.Mat();
-            cv.cvtColor(roiSrc, roiGray, cv.COLOR_RGBA2GRAY);
-            cv.threshold(roiGray, roiBinary, 150, 255, cv.THRESH_BINARY);
-            cv.bitwise_not(roiBinary, roiBinary);
-            
-            // Render to canvas for Tesseract (Critical fix: Tesseract can't read cv.Mat directly)
-            cv.imshow(ocrCanvasRef.current, roiBinary);
-            
-            workerRef.current.recognize(ocrCanvasRef.current)
-                .then((result: any) => {
-                    const text = result.data.text;
-                    const priceMatch = text.match(/(\d+\.\d{2,})/);
-                    const cleanText = priceMatch ? priceMatch[0] : text.replace(/[^0-9.:]/g, '').slice(0, 10);
-                    setStats(prev => ({ ...prev, ocrText: cleanText || prev.ocrText }));
-                }).catch(() => {});
-          }
-      }
-
       // --- COLOR DETECTION ---
       cv.cvtColor(src, srcRGB, cv.COLOR_RGBA2RGB);
       cv.cvtColor(srcRGB, hsv, cv.COLOR_RGB2HSV);
 
-      lowGreen = new cv.Mat(hsv.rows, hsv.cols, hsv.type(), new cv.Scalar(35, 50, 50, 0));
-      highGreen = new cv.Mat(hsv.rows, hsv.cols, hsv.type(), new cv.Scalar(85, 255, 255, 255));
-      lowRed1 = new cv.Mat(hsv.rows, hsv.cols, hsv.type(), new cv.Scalar(0, 50, 50, 0));
-      highRed1 = new cv.Mat(hsv.rows, hsv.cols, hsv.type(), new cv.Scalar(10, 255, 255, 255));
-      lowRed2 = new cv.Mat(hsv.rows, hsv.cols, hsv.type(), new cv.Scalar(170, 50, 50, 0));
-      highRed2 = new cv.Mat(hsv.rows, hsv.cols, hsv.type(), new cv.Scalar(180, 255, 255, 255));
+      // Tuned Ranges for Candles (Typical TradingView/Broker colors)
+      const lowGreen = new cv.Mat(hsv.rows, hsv.cols, hsv.type(), new cv.Scalar(35, 50, 50, 0));
+      const highGreen = new cv.Mat(hsv.rows, hsv.cols, hsv.type(), new cv.Scalar(85, 255, 255, 255));
+      const lowRed1 = new cv.Mat(hsv.rows, hsv.cols, hsv.type(), new cv.Scalar(0, 50, 50, 0));
+      const highRed1 = new cv.Mat(hsv.rows, hsv.cols, hsv.type(), new cv.Scalar(10, 255, 255, 255));
+      const lowRed2 = new cv.Mat(hsv.rows, hsv.cols, hsv.type(), new cv.Scalar(170, 50, 50, 0));
+      const highRed2 = new cv.Mat(hsv.rows, hsv.cols, hsv.type(), new cv.Scalar(180, 255, 255, 255));
       
       cv.inRange(hsv, lowGreen, highGreen, maskGreen);
       
-      maskRed1 = new cv.Mat();
-      maskRed2 = new cv.Mat();
+      const maskRed1 = new cv.Mat();
+      const maskRed2 = new cv.Mat();
       cv.inRange(hsv, lowRed1, highRed1, maskRed1);
       cv.inRange(hsv, lowRed2, highRed2, maskRed2);
       cv.addWeighted(maskRed1, 1.0, maskRed2, 1.0, 0.0, maskRed);
+      
+      maskRed1.delete(); maskRed2.delete(); lowGreen.delete(); highGreen.delete();
+      lowRed1.delete(); highRed1.delete(); lowRed2.delete(); highRed2.delete();
 
       cv.findContours(maskGreen, contoursGreen, hierarchyGreen, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
       cv.findContours(maskRed, contoursRed, hierarchyRed, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
 
-      let greenCandles: any[] = [];
-      let redCandles: any[] = [];
+      // --- ADVANCED CANDLE PARSING ---
+      const parseCandle = (contour: any, colorType: 'GREEN' | 'RED') => {
+        const rect = cv.boundingRect(contour);
+        
+        // Skip tiny noise
+        if (rect.height < 5 || rect.width < 3) return null;
 
-      // FIX MEMORY LEAK: Must delete cnt after getting from MatVector
+        const halfH = Math.floor(rect.height / 2);
+        
+        const safeRoi = (y: number, h: number) => {
+            if (y < 0) return 0;
+            if (y + h > src.rows) return src.rows - y;
+            return h;
+        };
+
+        let topDensity = 0;
+        let bottomDensity = 0;
+
+        try {
+            const topRoiRect = new cv.Rect(rect.x, rect.y, rect.width, safeRoi(rect.y, halfH));
+            const bottomRoiRect = new cv.Rect(rect.x, rect.y + halfH, rect.width, safeRoi(rect.y + halfH, halfH));
+
+            const mask = colorType === 'GREEN' ? maskGreen : maskRed;
+            
+            if (topRoiRect.height > 0 && bottomRoiRect.height > 0) {
+                const topRoi = mask.roi(topRoiRect);
+                const bottomRoi = mask.roi(bottomRoiRect);
+                
+                topDensity = cv.countNonZero(topRoi);
+                bottomDensity = cv.countNonZero(bottomRoi);
+
+                topRoi.delete();
+                bottomRoi.delete();
+            }
+        } catch(e) {}
+
+        // --- Shape Classification Logic ---
+        let shape = 'NORMAL';
+        
+        // 1. Must be distinctively vertical to be a valid candle for pattern recognition
+        if (rect.height > rect.width * 1.5) { 
+            
+            // Calculate ratio to avoid division by zero
+            const densityRatio = topDensity / (bottomDensity + 0.1);
+            
+            // Hammer: Mass is at the TOP (Head), Wick is at bottom.
+            // Top density should be significantly higher than bottom density.
+            if (densityRatio > 2.5) {
+                shape = 'HAMMER';
+            } 
+            // Shooting Star / Inverted Hammer: Mass is at BOTTOM (Head), Wick is at top.
+            // Bottom density should be significantly higher.
+            else if (densityRatio < 0.4) {
+                shape = 'SHOOTING_STAR'; 
+            }
+        }
+        
+        return { ...rect, type: colorType, shape, topDensity, bottomDensity };
+      };
+
+      let candles: any[] = [];
+
       for (let i = 0; i < contoursGreen.size(); ++i) {
         let cnt = contoursGreen.get(i);
-        if (cv.contourArea(cnt) > 50) {
-          let rect = cv.boundingRect(cnt);
-          greenCandles.push({ ...rect, type: 'GREEN' });
+        if (cv.contourArea(cnt) > 30) { 
+          const c = parseCandle(cnt, 'GREEN');
+          if (c) candles.push(c);
         }
         cnt.delete();
       }
 
       for (let i = 0; i < contoursRed.size(); ++i) {
         let cnt = contoursRed.get(i);
-        if (cv.contourArea(cnt) > 50) {
-          let rect = cv.boundingRect(cnt);
-          redCandles.push({ ...rect, type: 'RED' });
+        if (cv.contourArea(cnt) > 30) {
+          const c = parseCandle(cnt, 'RED');
+          if (c) candles.push(c);
         }
         cnt.delete();
       }
 
-      const allCandles = [...greenCandles, ...redCandles].sort((a, b) => a.x - b.x);
+      // Sort candles left to right
+      candles = candles.sort((a, b) => a.x - b.x);
 
-      // --- DRAW CANDLES & VOLUME HIGHLIGHT ---
-      // Restore drawing for ALL candles as requested
-      allCandles.forEach((c, index) => {
-        const isLast = index === allCandles.length - 1;
-        const color = c.type === 'GREEN' ? new cv.Scalar(0, 255, 0, 255) : new cv.Scalar(255, 0, 0, 255);
-        
-        // Draw the bounding box for ALL candles
-        cv.rectangle(src, {x: c.x, y: c.y}, {x: c.x + c.width, y: c.y + c.height}, color, 2);
-        
-        // Highlight active (LAST) candle specially
-        if (isLast) {
-          // Glow effect
-          cv.rectangle(src, {x: c.x - 2, y: c.y - 2}, {x: c.x + c.width + 2, y: c.y + c.height + 2}, new cv.Scalar(255, 255, 255, 100), 1);
+      // --- TREND LINE (SUPPORT/RESISTANCE) DETECTION ---
+      // We keep the logic to calculate confluence, but we DO NOT DRAW them anymore
+      const detectLevels = (candleList: any[]) => {
+          const threshold = 10; // Pixel tolerance
+          const minTouches = 2; 
           
-          // Show Volume (Area size) with Background
-          const volume = c.width * c.height;
-          const volText = `VOL: ${volume}`;
-          const textY = c.type === 'GREEN' ? c.y - 15 : c.y + c.height + 25;
-          const textX = Math.max(0, c.x - 20); // Prevent off-screen
+          const highs = candleList.map(c => c.y).sort((a,b) => a - b);
+          const lows = candleList.map(c => c.y + c.height).sort((a,b) => a - b);
           
-          // Text Background
-          const textWidth = volText.length * 10;
-          cv.rectangle(src, {x: textX - 2, y: textY - 12}, {x: textX + textWidth, y: textY + 4}, new cv.Scalar(0, 0, 0, 180), -1);
-          
-          cv.putText(src, volText, {x: textX, y: textY}, cv.FONT_HERSHEY_PLAIN, 1.1, new cv.Scalar(255, 255, 255, 255), 1);
-        }
+          const getClusters = (points: number[]) => {
+              const clusters: {y: number, count: number}[] = [];
+              if (points.length === 0) return clusters;
+              
+              let currentSum = points[0];
+              let currentCount = 1;
+              let currentStart = points[0];
+
+              for(let i=1; i<points.length; i++) {
+                  if (points[i] - currentStart <= threshold) {
+                      currentSum += points[i];
+                      currentCount++;
+                  } else {
+                      if (currentCount >= minTouches) {
+                          clusters.push({ y: currentSum/currentCount, count: currentCount });
+                      }
+                      currentSum = points[i];
+                      currentCount = 1;
+                      currentStart = points[i];
+                  }
+              }
+              if (currentCount >= minTouches) {
+                  clusters.push({ y: currentSum/currentCount, count: currentCount });
+              }
+              return clusters;
+          };
+
+          return {
+              resistance: getClusters(highs),
+              support: getClusters(lows)
+          };
+      };
+
+      const levels = detectLevels(candles);
+
+      // --- VISUALIZATION: REMOVED S/R LINES TO CLEAN UI ---
+      // Logic below still uses levels for signal confirmation.
+      
+      // We only draw boxes around candles to verify detection is working
+      candles.forEach(c => {
+         const color = c.type === 'GREEN' ? new cv.Scalar(0, 255, 0, 150) : new cv.Scalar(255, 0, 0, 150);
+         // Thinner line for less pollution
+         cv.rectangle(src, {x: c.x, y: c.y}, {x: c.x + c.width, y: c.y + c.height}, color, 1);
       });
 
-      // --- ZONES & TARGETS LOGIC ---
-      if (allCandles.length > 0) {
-        const lastCandle = allCandles[allCandles.length - 1];
-        const currentPriceY = lastCandle.type === 'GREEN' ? lastCandle.y : (lastCandle.y + lastCandle.height);
-
-        // Collect levels
-        const levels: number[] = [];
-        allCandles.forEach(c => {
-            levels.push(c.y); 
-            levels.push(c.y + c.height); 
-        });
-        levels.sort((a, b) => a - b);
-
-        // Calculate Zones
-        const zones: { y: number, strength: number }[] = [];
-        const tolerance = 15;
-        if (levels.length > 0) {
-            let currentGroup = [levels[0]];
-            for(let i=1; i<levels.length; i++) {
-                if (levels[i] - currentGroup[0] <= tolerance) {
-                    currentGroup.push(levels[i]);
-                } else {
-                    if (currentGroup.length >= 3) {
-                        const avg = currentGroup.reduce((a,b)=>a+b,0) / currentGroup.length;
-                        zones.push({ y: avg, strength: currentGroup.length });
-                    }
-                    currentGroup = [levels[i]];
-                }
-            }
-            if (currentGroup.length >= 3) {
-                const avg = currentGroup.reduce((a,b)=>a+b,0) / currentGroup.length;
-                zones.push({ y: avg, strength: currentGroup.length });
-            }
-        }
-
-        // FILTER: Find only CLOSEST Support and Resistance
-        let closestResistance = null;
-        let closestSupport = null;
-
-        const resistances = zones.filter(z => z.y < currentPriceY - 20).sort((a, b) => b.y - a.y);
-        const supports = zones.filter(z => z.y > currentPriceY + 20).sort((a, b) => a.y - b.y);
-
-        if (resistances.length > 0) closestResistance = resistances[0];
-        if (supports.length > 0) closestSupport = supports[0];
-
-        // Draw ONLY the closest zones with Clean Labels
-        if (closestResistance) {
-             const y = Math.round(closestResistance.y);
-             // Line
-             cv.line(src, {x: 0, y: y}, {x: canvas.width, y: y}, new cv.Scalar(255, 50, 100, 200), 2);
-             
-             // Label with Background
-             const label = "ALVO: VENDA";
-             const labelX = canvas.width - 160;
-             cv.rectangle(src, {x: labelX - 5, y: y - 25}, {x: canvas.width, y: y - 2}, new cv.Scalar(180, 20, 50, 200), -1);
-             cv.putText(src, label, {x: labelX, y: y - 10}, cv.FONT_HERSHEY_PLAIN, 1.2, new cv.Scalar(255, 255, 255, 255), 1);
-        }
-
-        if (closestSupport) {
-             const y = Math.round(closestSupport.y);
-             // Line
-             cv.line(src, {x: 0, y: y}, {x: canvas.width, y: y}, new cv.Scalar(50, 255, 100, 200), 2);
-             
-             // Label with Background
-             const label = "ALVO: COMPRA";
-             const labelX = canvas.width - 160;
-             cv.rectangle(src, {x: labelX - 5, y: y + 2}, {x: canvas.width, y: y + 25}, new cv.Scalar(20, 180, 50, 200), -1);
-             cv.putText(src, label, {x: labelX, y: y + 18}, cv.FONT_HERSHEY_PLAIN, 1.2, new cv.Scalar(255, 255, 255, 255), 1);
-        }
-      }
-
-      // --- MARKET ANALYSIS LOOP ---
-      // ... (Rest of logic remains same, but using locals) ...
+      // --- STRATEGY: REVERSAL + CONFIRMATION + S/R ---
       const now = new Date();
       const seconds = now.getSeconds();
       const isSignalWindow = (seconds >= 50 && seconds <= 59);
 
-      let pressureScore = 0;
-      let phase: any = 'NEUTRO';
-      let sma9 = 0;
-      let validBB = false;
       let type: 'CALL' | 'PUT' | 'NEUTRAL' = 'NEUTRAL';
       let confidence = 0;
-      let reasons: string[] = [];
       let method = '---';
-      let isStrategySignal = false;
-      let breakoutState = '---';
+      let reasons: string[] = [];
+      let pressureScore = 0;
+      let phase: any = 'NEUTRO';
 
-      if (allCandles.length >= 4) {
-        const getCloseY = (c: any) => c.type === 'GREEN' ? c.y : (c.y + c.height);
-        
-        if (allCandles.length >= 9) {
-            const period = 9;
-            const deviation = 1.5;
-            const lastCandles = allCandles.slice(-period);
-            const sumY = lastCandles.reduce((sum, c) => sum + getCloseY(c), 0);
-            sma9 = sumY / period;
-            const squaredDiffs = lastCandles.map(c => Math.pow(getCloseY(c) - sma9, 2));
-            const avgSquaredDiff = squaredDiffs.reduce((a, b) => a + b, 0) / period;
-            const stdDev = Math.sqrt(avgSquaredDiff);
-            const upperBandY = sma9 - (stdDev * deviation);
-            const lowerBandY = sma9 + (stdDev * deviation);
+      if (candles.length >= 3) {
+          const current = candles[candles.length - 1];   
+          const prev1 = candles[candles.length - 2];     
+          const prev2 = candles[candles.length - 3];     
 
-            validBB = true;
-            
-            // Draw Bands VERY Faintly
-            cv.line(src, {x: 0, y: Math.round(sma9)}, {x: canvas.width, y: Math.round(sma9)}, new cv.Scalar(255, 255, 0, 60), 1);
-            cv.line(src, {x: 0, y: Math.round(upperBandY)}, {x: canvas.width, y: Math.round(upperBandY)}, new cv.Scalar(0, 255, 255, 40), 1);
-            cv.line(src, {x: 0, y: Math.round(lowerBandY)}, {x: canvas.width, y: Math.round(lowerBandY)}, new cv.Scalar(0, 255, 255, 40), 1);
-        }
+          // Pressure Calc
+          const greenArea = candles.filter(c => c.type === 'GREEN').reduce((a,c) => a + (c.width*c.height), 0);
+          const redArea = candles.filter(c => c.type === 'RED').reduce((a,c) => a + (c.width*c.height), 0);
+          const totalArea = greenArea + redArea;
+          pressureScore = totalArea > 0 ? ((greenArea - redArea) / totalArea) * 100 : 0;
+          
+          if (pressureScore > 20) phase = 'COMPRADORA';
+          else if (pressureScore < -20) phase = 'VENDEDORA';
+          else phase = 'CONSOLIDAÇÃO';
 
-        const greenArea = greenCandles.reduce((acc, c) => acc + (c.width * c.height), 0);
-        const redArea = redCandles.reduce((acc, c) => acc + (c.width * c.height), 0);
-        const totalArea = greenArea + redArea;
-        pressureScore = totalArea > 0 ? ((greenArea - redArea) / totalArea) * 100 : 0;
+          // CALL SETUP
+          if (prev2.type === 'RED') {
+              const isReversalCandle = (prev1.shape === 'HAMMER' || prev1.type === 'GREEN' || prev1.height < prev2.height * 0.6);
+              if (isReversalCandle && current.type === 'GREEN') {
+                  const reversalHighY = prev1.y; // Top of reversal candle
+                  const currentHighY = current.y; // Top of current candle
+                  const breakoutPixels = reversalHighY - currentHighY;
+                  
+                  if (breakoutPixels > CONFIRMATION_THRESHOLD) {
+                      type = 'CALL';
+                      method = prev1.shape === 'HAMMER' ? 'HAMMER + BREAKOUT' : 'REVERSÃO + CONFIRMAÇÃO';
+                      reasons.push('TENDÊNCIA BAIXA');
+                      reasons.push(prev1.shape === 'HAMMER' ? 'PADRÃO HAMMER' : 'VELA REVERSÃO');
+                      reasons.push(`ROMPIMENTO >${CONFIRMATION_THRESHOLD}px`);
+                      
+                      const currentLow = current.y + current.height;
+                      // Logic uses support level even if not drawn
+                      const hasSupport = levels.support.some(lvl => Math.abs(currentLow - lvl.y) < 20);
+                      if (hasSupport) {
+                          reasons.push('ZONA SUPORTE');
+                          confidence += 10;
+                      }
 
-        if (Math.abs(pressureScore) < 20) phase = 'ACUMULAÇÃO';
-        else if (Math.abs(pressureScore) > 70) phase = 'EXPANSÃO';
-        else phase = 'DISTRIBUIÇÃO';
+                      confidence = Math.min(99, 90 + (hasSupport ? 5 : 0));
+                  }
+              }
+          }
 
-        if (isSignalWindow) {
-            const lastCandle = allCandles[allCandles.length - 1];
-            let consecutiveCount = 1;
-            for (let i = allCandles.length - 2; i >= 0; i--) {
-                if (allCandles[i].type === lastCandle.type) {
-                    consecutiveCount++;
-                } else {
-                    break;
-                }
-            }
+          // PUT SETUP
+          if (prev2.type === 'GREEN') {
+              const isReversalCandle = (prev1.shape === 'SHOOTING_STAR' || prev1.type === 'RED' || prev1.height < prev2.height * 0.6);
+              if (isReversalCandle && current.type === 'RED') {
+                  const reversalLowY = prev1.y + prev1.height; // Bottom of reversal candle
+                  const currentLowY = current.y + current.height; // Bottom of current candle
+                  const breakoutPixels = currentLowY - reversalLowY;
+                  
+                  if (breakoutPixels > CONFIRMATION_THRESHOLD) {
+                      type = 'PUT';
+                      method = prev1.shape === 'SHOOTING_STAR' ? 'SHOOTING STAR + BREAKOUT' : 'REVERSÃO + CONFIRMAÇÃO';
+                      reasons.push('TENDÊNCIA ALTA');
+                      reasons.push(prev1.shape === 'SHOOTING_STAR' ? 'PADRÃO SHOOTING STAR' : 'VELA REVERSÃO');
+                      reasons.push(`ROMPIMENTO >${CONFIRMATION_THRESHOLD}px`);
 
-            let isExhausted = false;
-            const recentCandles = allCandles.slice(-4, -1);
-            if (recentCandles.length > 0) {
-                const avgHeight = recentCandles.reduce((sum, c) => sum + c.height, 0) / recentCandles.length;
-                if (lastCandle.height > avgHeight * 2.5) { 
-                    isExhausted = true;
-                    phase = 'EXAUSTÃO (CLÍMAX)';
-                }
-            }
-            if (consecutiveCount >= 5) {
-                isExhausted = true;
-                phase = 'EXAUSTÃO (SEQUÊNCIA)';
-            }
+                      const currentHigh = current.y;
+                      // Logic uses resistance level even if not drawn
+                      const hasResistance = levels.resistance.some(lvl => Math.abs(currentHigh - lvl.y) < 20);
+                      if (hasResistance) {
+                          reasons.push('ZONA RESISTÊNCIA');
+                          confidence += 10;
+                      }
 
-            if (validBB && !isExhausted) {
-                 const lastCloseY = getCloseY(lastCandle);
-                 method = 'ANÁLISE TÉCNICA';
-
-                 if (consecutiveCount === 4 && lastCandle.type === 'GREEN') {
-                     if (lastCloseY < sma9 - 2) { 
-                         type = 'CALL';
-                         method = '4 VELAS + BB';
-                         reasons.push('4 VELAS ALTA');
-                         reasons.push('ROMPIMENTO MÉDIA');
-                         isStrategySignal = true;
-                         breakoutState = 'CONFIRMADO';
-                     }
-                 }
-                 else if (consecutiveCount === 4 && lastCandle.type === 'RED') {
-                     if (lastCloseY > sma9 + 2) {
-                         type = 'PUT';
-                         method = '4 VELAS + BB';
-                         reasons.push('4 VELAS BAIXA');
-                         reasons.push('ROMPIMENTO MÉDIA');
-                         isStrategySignal = true;
-                         breakoutState = 'CONFIRMADO';
-                     }
-                 }
-            }
-
-            confidence = 50 + Math.abs(pressureScore) * 0.4;
-            if (isStrategySignal) confidence += 20;
-            confidence = Math.min(confidence, 99);
-        }
+                      confidence = Math.min(99, 90 + (hasResistance ? 5 : 0));
+                  }
+              }
+          }
       }
 
       setSignal({
         type: isSignalWindow ? type : 'NEUTRAL',
-        confidence: isSignalWindow ? Math.round(confidence) : 0,
-        reasons: isSignalWindow ? reasons.slice(0, 3) : [],
+        confidence: isSignalWindow ? confidence : 0,
+        reasons: isSignalWindow ? reasons : [],
         timestamp: Date.now(),
         method: isSignalWindow ? method : '---',
         marketData: {
           pressureScore: Math.round(pressureScore),
           phase,
           mathPrediction: isSignalWindow ? type : 'NEUTRAL',
-          mathScore: isSignalWindow ? Math.round(confidence) : 0,
-          breakout: isSignalWindow ? breakoutState : '---',
+          mathScore: isSignalWindow ? confidence : 0,
+          breakout: '---',
           zone: pressureScore > 0 ? 'COMPRA' : 'VENDA'
         }
       });
+
+      // OCR TRIGGER (Refined)
+      if (frameCountRef.current % 15 === 0 && workerRef.current) {
+         // Detect Right Side (Price)
+         const priceRoi = new cv.Rect(src.cols - 120, 0, 120, src.rows);
+         // Detect Bottom Right (Time)
+         const timeRoi = new cv.Rect(src.cols - 200, src.rows - 60, 200, 60);
+         
+         if (priceRoi.width > 0 && priceRoi.height > 0) {
+            const dataUrl = preprocessImageForOCR(cv, src, priceRoi);
+            if (dataUrl) {
+                workerRef.current.recognize(dataUrl).then((result: any) => {
+                    const text = result.data.text.replace(/[^0-9.,]/g, '');
+                    setStats(prev => ({ ...prev, ocrText: text }));
+                }).catch(() => {});
+            }
+         }
+      }
 
       cv.imshow(canvas, src);
 
     } catch (e) {
       console.error("OpenCV processing error:", e);
     } finally {
-      // CLEANUP ALL MATS
       if (src) src.delete();
       if (srcRGB) srcRGB.delete();
       if (hsv) hsv.delete();
@@ -478,19 +486,6 @@ export const useScreenProcessor = (videoRef: React.RefObject<HTMLVideoElement>, 
       if (hierarchyGreen) hierarchyGreen.delete();
       if (hierarchyRed) hierarchyRed.delete();
       
-      if (lowGreen) lowGreen.delete();
-      if (highGreen) highGreen.delete();
-      if (lowRed1) lowRed1.delete();
-      if (highRed1) highRed1.delete();
-      if (lowRed2) lowRed2.delete();
-      if (highRed2) highRed2.delete();
-      if (maskRed1) maskRed1.delete();
-      if (maskRed2) maskRed2.delete();
-      
-      if (roiSrc) roiSrc.delete();
-      if (roiGray) roiGray.delete();
-      if (roiBinary) roiBinary.delete();
-
       const endTime = performance.now();
       setStats(prev => ({ 
         ...prev, 
@@ -504,7 +499,7 @@ export const useScreenProcessor = (videoRef: React.RefObject<HTMLVideoElement>, 
   // Run analysis loop
   useEffect(() => {
     if (isProcessing) {
-      processingInterval.current = window.setInterval(analyzeFrame, 250); 
+      processingInterval.current = window.setInterval(analyzeFrame, 200); 
     } else {
       if (processingInterval.current) clearInterval(processingInterval.current);
     }
