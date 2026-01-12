@@ -33,10 +33,11 @@ export const SignalDisplay: React.FC<SignalDisplayProps> = ({ signal, timer }) =
                 isPut ? 'text-[#ff3366] drop-shadow-[0_0_30px_rgba(255,51,102,0.8)]' : 
                 'text-[#333]'
             }`}>
-                {isNeutral ? 'AGUARDANDO' : isCall ? '⬆ CALL' : '⬇ PUT'}
+                {isNeutral ? 'AGUARDANDO' : isCall ? '⬆ SOBE' : '⬇ DESCE'}
             </div>
             <div className={`text-xs font-outfit mt-2 transition-colors duration-300 ${isCall ? 'text-[#00ff88]' : isPut ? 'text-[#ff3366]' : 'text-[#999]'}`}>
-                {isNeutral ? 'Analisando mercado em tempo real...' : `Sinal Detectado - ${signal.reasons.length} confluências`}
+                {isNeutral ? 'Analisando mercado em tempo real...' : 
+                 isCall ? 'COMPRA CONFIRMADA' : 'VENDA CONFIRMADA'}
             </div>
         </div>
 

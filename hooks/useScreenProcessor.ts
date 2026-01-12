@@ -149,7 +149,7 @@ export const useScreenProcessor = (videoRef: React.RefObject<HTMLVideoElement>, 
     return dataUrl;
   };
 
-  // --- CORE LOGIC: REVERSAL STRATEGY + ADVANCED CANDLE DETECTION ---
+  // --- CORE LOGIC: REVERSAL STRATEGY + FLOW STRATEGY ---
   const analyzeFrame = useCallback(async () => {
     if (!cvReady || !videoRef.current || !canvasRef.current || !isProcessing) return;
     
@@ -216,13 +216,11 @@ export const useScreenProcessor = (videoRef: React.RefObject<HTMLVideoElement>, 
       cv.findContours(maskGreen, contoursGreen, hierarchyGreen, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
       cv.findContours(maskRed, contoursRed, hierarchyRed, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
 
-      // --- ADVANCED CANDLE PARSING ---
+      // --- CANDLE PARSING ---
       const parseCandle = (contour: any, colorType: 'GREEN' | 'RED') => {
         const rect = cv.boundingRect(contour);
-        
         // Skip tiny noise
         if (rect.height < 5 || rect.width < 3) return null;
-
         const halfH = Math.floor(rect.height / 2);
         
         const safeRoi = (y: number, h: number) => {
@@ -243,32 +241,21 @@ export const useScreenProcessor = (videoRef: React.RefObject<HTMLVideoElement>, 
             if (topRoiRect.height > 0 && bottomRoiRect.height > 0) {
                 const topRoi = mask.roi(topRoiRect);
                 const bottomRoi = mask.roi(bottomRoiRect);
-                
                 topDensity = cv.countNonZero(topRoi);
                 bottomDensity = cv.countNonZero(bottomRoi);
-
                 topRoi.delete();
                 bottomRoi.delete();
             }
         } catch(e) {}
 
-        // --- Shape Classification Logic ---
         let shape = 'NORMAL';
-        
-        // 1. Must be distinctively vertical to be a valid candle for pattern recognition
+        // Roughly estimate wick size based on density gaps or shape
+        // This is a simplification for visual analysis
         if (rect.height > rect.width * 1.5) { 
-            
-            // Calculate ratio to avoid division by zero
             const densityRatio = topDensity / (bottomDensity + 0.1);
-            
-            // Hammer: Mass is at the TOP (Head), Wick is at bottom.
-            // Top density should be significantly higher than bottom density.
             if (densityRatio > 2.5) {
                 shape = 'HAMMER';
-            } 
-            // Shooting Star / Inverted Hammer: Mass is at BOTTOM (Head), Wick is at top.
-            // Bottom density should be significantly higher.
-            else if (densityRatio < 0.4) {
+            } else if (densityRatio < 0.4) {
                 shape = 'SHOOTING_STAR'; 
             }
         }
@@ -277,7 +264,6 @@ export const useScreenProcessor = (videoRef: React.RefObject<HTMLVideoElement>, 
       };
 
       let candles: any[] = [];
-
       for (let i = 0; i < contoursGreen.size(); ++i) {
         let cnt = contoursGreen.get(i);
         if (cv.contourArea(cnt) > 30) { 
@@ -286,7 +272,6 @@ export const useScreenProcessor = (videoRef: React.RefObject<HTMLVideoElement>, 
         }
         cnt.delete();
       }
-
       for (let i = 0; i < contoursRed.size(); ++i) {
         let cnt = contoursRed.get(i);
         if (cv.contourArea(cnt) > 30) {
@@ -296,26 +281,21 @@ export const useScreenProcessor = (videoRef: React.RefObject<HTMLVideoElement>, 
         cnt.delete();
       }
 
-      // Sort candles left to right
       candles = candles.sort((a, b) => a.x - b.x);
 
-      // --- TREND LINE (SUPPORT/RESISTANCE) DETECTION ---
-      // We keep the logic to calculate confluence, but we DO NOT DRAW them anymore
+      // --- S/R LEVELS (Calculation Only - No Drawing) ---
       const detectLevels = (candleList: any[]) => {
-          const threshold = 10; // Pixel tolerance
+          const threshold = 10; 
           const minTouches = 2; 
-          
           const highs = candleList.map(c => c.y).sort((a,b) => a - b);
           const lows = candleList.map(c => c.y + c.height).sort((a,b) => a - b);
           
           const getClusters = (points: number[]) => {
               const clusters: {y: number, count: number}[] = [];
               if (points.length === 0) return clusters;
-              
               let currentSum = points[0];
               let currentCount = 1;
               let currentStart = points[0];
-
               for(let i=1; i<points.length; i++) {
                   if (points[i] - currentStart <= threshold) {
                       currentSum += points[i];
@@ -334,26 +314,17 @@ export const useScreenProcessor = (videoRef: React.RefObject<HTMLVideoElement>, 
               }
               return clusters;
           };
-
-          return {
-              resistance: getClusters(highs),
-              support: getClusters(lows)
-          };
+          return { resistance: getClusters(highs), support: getClusters(lows) };
       };
-
       const levels = detectLevels(candles);
 
-      // --- VISUALIZATION: REMOVED S/R LINES TO CLEAN UI ---
-      // Logic below still uses levels for signal confirmation.
-      
-      // We only draw boxes around candles to verify detection is working
+      // --- VISUALIZATION: Clean (Just boxes) ---
       candles.forEach(c => {
          const color = c.type === 'GREEN' ? new cv.Scalar(0, 255, 0, 150) : new cv.Scalar(255, 0, 0, 150);
-         // Thinner line for less pollution
          cv.rectangle(src, {x: c.x, y: c.y}, {x: c.x + c.width, y: c.y + c.height}, color, 1);
       });
 
-      // --- STRATEGY: REVERSAL + CONFIRMATION + S/R ---
+      // --- STRATEGY ENGINE ---
       const now = new Date();
       const seconds = now.getSeconds();
       const isSignalWindow = (seconds >= 50 && seconds <= 59);
@@ -376,62 +347,109 @@ export const useScreenProcessor = (videoRef: React.RefObject<HTMLVideoElement>, 
           const totalArea = greenArea + redArea;
           pressureScore = totalArea > 0 ? ((greenArea - redArea) / totalArea) * 100 : 0;
           
-          if (pressureScore > 20) phase = 'COMPRADORA';
-          else if (pressureScore < -20) phase = 'VENDEDORA';
+          if (pressureScore > 30) phase = 'COMPRADORA';
+          else if (pressureScore < -30) phase = 'VENDEDORA';
           else phase = 'CONSOLIDAÇÃO';
 
-          // CALL SETUP
+          // 1. CHECK REVERSAL STRATEGY (PRIORITY - "A estratégia do robô")
+          let strategyFound = false;
+
+          // Call Reversal
           if (prev2.type === 'RED') {
-              const isReversalCandle = (prev1.shape === 'HAMMER' || prev1.type === 'GREEN' || prev1.height < prev2.height * 0.6);
+              const isReversalCandle = (prev1.shape === 'HAMMER' || prev1.type === 'GREEN');
               if (isReversalCandle && current.type === 'GREEN') {
-                  const reversalHighY = prev1.y; // Top of reversal candle
-                  const currentHighY = current.y; // Top of current candle
-                  const breakoutPixels = reversalHighY - currentHighY;
+                  const reversalHighY = prev1.y;
+                  const currentHighY = current.y;
                   
-                  if (breakoutPixels > CONFIRMATION_THRESHOLD) {
+                  if (reversalHighY - currentHighY > CONFIRMATION_THRESHOLD) {
                       type = 'CALL';
                       method = prev1.shape === 'HAMMER' ? 'HAMMER + BREAKOUT' : 'REVERSÃO + CONFIRMAÇÃO';
                       reasons.push('TENDÊNCIA BAIXA');
-                      reasons.push(prev1.shape === 'HAMMER' ? 'PADRÃO HAMMER' : 'VELA REVERSÃO');
-                      reasons.push(`ROMPIMENTO >${CONFIRMATION_THRESHOLD}px`);
+                      reasons.push('REVERSÃO CONFIRMADA');
                       
                       const currentLow = current.y + current.height;
-                      // Logic uses support level even if not drawn
                       const hasSupport = levels.support.some(lvl => Math.abs(currentLow - lvl.y) < 20);
-                      if (hasSupport) {
-                          reasons.push('ZONA SUPORTE');
-                          confidence += 10;
-                      }
-
-                      confidence = Math.min(99, 90 + (hasSupport ? 5 : 0));
+                      if (hasSupport) reasons.push('ZONA SUPORTE');
+                      
+                      confidence = hasSupport ? 95 : 90;
+                      strategyFound = true;
                   }
               }
           }
 
-          // PUT SETUP
-          if (prev2.type === 'GREEN') {
-              const isReversalCandle = (prev1.shape === 'SHOOTING_STAR' || prev1.type === 'RED' || prev1.height < prev2.height * 0.6);
+          // Put Reversal
+          if (!strategyFound && prev2.type === 'GREEN') {
+              const isReversalCandle = (prev1.shape === 'SHOOTING_STAR' || prev1.type === 'RED');
               if (isReversalCandle && current.type === 'RED') {
-                  const reversalLowY = prev1.y + prev1.height; // Bottom of reversal candle
-                  const currentLowY = current.y + current.height; // Bottom of current candle
-                  const breakoutPixels = currentLowY - reversalLowY;
+                  const reversalLowY = prev1.y + prev1.height;
+                  const currentLowY = current.y + current.height;
                   
-                  if (breakoutPixels > CONFIRMATION_THRESHOLD) {
+                  if (currentLowY - reversalLowY > CONFIRMATION_THRESHOLD) {
                       type = 'PUT';
                       method = prev1.shape === 'SHOOTING_STAR' ? 'SHOOTING STAR + BREAKOUT' : 'REVERSÃO + CONFIRMAÇÃO';
                       reasons.push('TENDÊNCIA ALTA');
-                      reasons.push(prev1.shape === 'SHOOTING_STAR' ? 'PADRÃO SHOOTING STAR' : 'VELA REVERSÃO');
-                      reasons.push(`ROMPIMENTO >${CONFIRMATION_THRESHOLD}px`);
+                      reasons.push('REVERSÃO CONFIRMADA');
 
                       const currentHigh = current.y;
-                      // Logic uses resistance level even if not drawn
                       const hasResistance = levels.resistance.some(lvl => Math.abs(currentHigh - lvl.y) < 20);
-                      if (hasResistance) {
-                          reasons.push('ZONA RESISTÊNCIA');
-                          confidence += 10;
-                      }
+                      if (hasResistance) reasons.push('ZONA RESISTÊNCIA');
 
-                      confidence = Math.min(99, 90 + (hasResistance ? 5 : 0));
+                      confidence = hasResistance ? 95 : 90;
+                      strategyFound = true;
+                  }
+              }
+          }
+
+          // 2. CHECK FLOW/TREND STRATEGY (ONLY IF NO REVERSAL FOUND AND 100% CERTAIN)
+          // "Gera apenas um sinal de fluxo, depois volta a procurar a estratégia principal"
+          // CRITERIA: "Vela de força" OR "Vela de Continuação"
+          if (!strategyFound) {
+              
+              const avgHeight = (prev1.height + prev2.height) / 2;
+              
+              // BULLISH FLOW (100% Certainty Check)
+              if (phase === 'COMPRADORA' && current.type === 'GREEN' && prev1.type === 'GREEN') {
+                  
+                  // Vela de Força (Marubozu/Big Body): Significantly larger than average
+                  const isForceCandle = current.height >= avgHeight * 1.3;
+                  
+                  // Vela de Continuação: Healthy body size (at least average) AND aligned with trend
+                  const isContinuationCandle = current.height >= avgHeight * 0.9;
+                  
+                  // CRITICAL: No Rejection (Small or no top wick)
+                  // We check this via shape (not SHOOTING_STAR) and assuming density distribution is balanced or bottom-heavy
+                  const noRejection = current.shape !== 'SHOOTING_STAR'; 
+
+                  if ((isForceCandle || isContinuationCandle) && noRejection) {
+                      type = 'CALL';
+                      method = isForceCandle ? 'VELA DE FORÇA (100%)' : 'CONTINUAÇÃO (100%)';
+                      confidence = 100;
+                      reasons.push(isForceCandle ? 'FORÇA COMPRADORA' : 'CONTINUAÇÃO DE ALTA');
+                      reasons.push('SEM REJEIÇÃO');
+                      reasons.push('FLUXO CONFIRMADO');
+                  }
+              }
+
+              // BEARISH FLOW (100% Certainty Check)
+              else if (phase === 'VENDEDORA' && current.type === 'RED' && prev1.type === 'RED') {
+                  
+                  // Vela de Força
+                  const isForceCandle = current.height >= avgHeight * 1.3;
+                  
+                  // Vela de Continuação
+                  const isContinuationCandle = current.height >= avgHeight * 0.9;
+                  
+                  // CRITICAL: No Rejection (Small or no bottom wick)
+                  // Check shape (not HAMMER)
+                  const noRejection = current.shape !== 'HAMMER';
+                  
+                  if ((isForceCandle || isContinuationCandle) && noRejection) {
+                      type = 'PUT';
+                      method = isForceCandle ? 'VELA DE FORÇA (100%)' : 'CONTINUAÇÃO (100%)';
+                      confidence = 100;
+                      reasons.push(isForceCandle ? 'FORÇA VENDEDORA' : 'CONTINUAÇÃO DE BAIXA');
+                      reasons.push('SEM REJEIÇÃO');
+                      reasons.push('FLUXO CONFIRMADO');
                   }
               }
           }
@@ -453,13 +471,9 @@ export const useScreenProcessor = (videoRef: React.RefObject<HTMLVideoElement>, 
         }
       });
 
-      // OCR TRIGGER (Refined)
+      // OCR Processing
       if (frameCountRef.current % 15 === 0 && workerRef.current) {
-         // Detect Right Side (Price)
          const priceRoi = new cv.Rect(src.cols - 120, 0, 120, src.rows);
-         // Detect Bottom Right (Time)
-         const timeRoi = new cv.Rect(src.cols - 200, src.rows - 60, 200, 60);
-         
          if (priceRoi.width > 0 && priceRoi.height > 0) {
             const dataUrl = preprocessImageForOCR(cv, src, priceRoi);
             if (dataUrl) {
