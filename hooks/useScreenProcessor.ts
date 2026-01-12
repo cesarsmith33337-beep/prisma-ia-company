@@ -134,29 +134,29 @@ export const useScreenProcessor = (videoRef: React.RefObject<HTMLVideoElement>, 
     const cv = window.cv;
     frameCountRef.current += 1;
     
-    // Declare all Mats for safe cleanup
-    let src = null;
-    let srcRGB = null;
-    let hsv = null;
-    let maskGreen = null;
-    let maskRed = null;
-    let contoursGreen = null;
-    let contoursRed = null;
-    let hierarchyGreen = null;
-    let hierarchyRed = null;
+    // Declare all Mats for safe cleanup with explicit any type
+    let src: any = null;
+    let srcRGB: any = null;
+    let hsv: any = null;
+    let maskGreen: any = null;
+    let maskRed: any = null;
+    let contoursGreen: any = null;
+    let contoursRed: any = null;
+    let hierarchyGreen: any = null;
+    let hierarchyRed: any = null;
     
-    let lowGreen = null;
-    let highGreen = null;
-    let lowRed1 = null;
-    let highRed1 = null;
-    let lowRed2 = null;
-    let highRed2 = null;
-    let maskRed1 = null;
-    let maskRed2 = null;
+    let lowGreen: any = null;
+    let highGreen: any = null;
+    let lowRed1: any = null;
+    let highRed1: any = null;
+    let lowRed2: any = null;
+    let highRed2: any = null;
+    let maskRed1: any = null;
+    let maskRed2: any = null;
 
-    let roiSrc = null;
-    let roiGray = null;
-    let roiBinary = null;
+    let roiSrc: any = null;
+    let roiGray: any = null;
+    let roiBinary: any = null;
 
     try {
       src = cv.imread(canvas);
