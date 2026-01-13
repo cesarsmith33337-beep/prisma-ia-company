@@ -117,12 +117,8 @@ export const useLiveSession = (videoRef: React.RefObject<HTMLVideoElement>) => {
             console.log("Gemini Live Connected");
             setIsConnected(true);
             
-            // Trigger the welcome message immediately and authorize analysis
-            sessionPromise.then(session => {
-                session.sendRealtimeInput({ 
-                    content: [{ parts: [{ text: `Sistema iniciado por ${nickname}. Confirme o início da análise imediatamente.` }] }]
-                });
-            });
+            // Note: Text injection via sendRealtimeInput is not supported for text content in this SDK version.
+            // The systemInstruction above handles the welcome message context.
             
             const source = inputCtx.createMediaStreamSource(stream);
             sourceRef.current = source;
